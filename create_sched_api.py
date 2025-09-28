@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 
-DB_PATH = "/app/energy_2.db"
+# DB_PATH = "/app/energy_2.db" # path to use when deploying on Synology server
+DB_PATH = "energy_2.db" # path to use when developing locally
 
 # Battery constraints
 BATTERY_CAPACITY = 30_000  # Wh
@@ -412,4 +413,4 @@ def get_consumption_forecast():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5005)
