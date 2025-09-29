@@ -23,12 +23,31 @@ def load_prices(conn):
     cur = conn.cursor()
     cur.execute("SELECT from_time, market_price FROM electricity_prices ORDER BY from_time")
     prices = {}
+    days = set()
+    latest_day = None
+    latest_day_prices = {}
     for row in cur.fetchall():
         utc_dt = datetime.strptime(row[0], "%Y-%m-%dT%H:%M:%S.%fZ")
         utc_dt = utc_dt.replace(tzinfo=ZoneInfo("UTC"))
         cet_dt = utc_dt.astimezone(ZoneInfo("Europe/Amsterdam"))
         cet_str = cet_dt.strftime("%Y-%m-%d %H:%M:%S")
         prices[cet_str] = row[1]
+        day_str = cet_dt.strftime("%Y-%m-%d")
+        days.add(day_str)
+        # Track latest day
+        if latest_day is None or day_str > latest_day:
+            latest_day = day_str
+    # Check for tomorrow's data
+    tomorrow = (datetime.now(ZoneInfo("Europe/Amsterdam")) + timedelta(days=1)).strftime("%Y-%m-%d")
+    has_tomorrow = any(ts.startswith(tomorrow) for ts in prices.keys())
+    if not has_tomorrow and latest_day:
+        # Copy latest day's prices to tomorrow
+        new_entries = {}
+        for ts, price in prices.items():
+            if ts.startswith(latest_day):
+                new_ts = tomorrow + ts[10:]
+                new_entries[new_ts] = price
+        prices.update(new_entries)
     return prices
 
 def load_consumption(conn):
@@ -47,11 +66,27 @@ def load_solar_forecast(conn):
     cur = conn.cursor()
     cur.execute("SELECT watt_hours_period, watt_hours_value FROM solar_forecast_hourly")
     forecast = {}
+    days = set()
+    latest_day = None
     for row in cur.fetchall():
         cet_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
         aligned_dt = cet_dt + timedelta(hours=-1)
         aligned_str = aligned_dt.strftime("%Y-%m-%d %H:%M:%S")
         forecast[aligned_str] = row[1]
+        day_str = aligned_dt.strftime("%Y-%m-%d")
+        days.add(day_str)
+        if latest_day is None or day_str > latest_day:
+            latest_day = day_str
+    # Check for tomorrow's forecast
+    tomorrow = (datetime.now(ZoneInfo("Europe/Amsterdam")) + timedelta(days=1)).strftime("%Y-%m-%d")
+    has_tomorrow = any(ts.startswith(tomorrow) for ts in forecast.keys())
+    if not has_tomorrow and latest_day:
+        new_entries = {}
+        for ts, value in forecast.items():
+            if ts.startswith(latest_day):
+                new_ts = tomorrow + ts[10:]
+                new_entries[new_ts] = value
+        forecast.update(new_entries)
     return forecast
 
 def build_hourly_times(forecast_date: str) -> list:
@@ -65,7 +100,7 @@ def get_prices_for_times(prices: dict, times: list) -> list:
 
 import numpy as np
 
-def find_two_largest_cheap_blocks(prices: list, n_blocks: int = 6, min_charging_block_hours: int = 4) -> list:
+def find_two_largest_cheap_blocks(prices: list, net_demand: list, n_blocks: int = 6, min_charging_block_hours: int = 4) -> list:
     """
     Find two non-overlapping blocks with the lowest average prices,
     each at least min_charging_block_hours long, and make sure the remaining
@@ -80,7 +115,7 @@ def find_two_largest_cheap_blocks(prices: list, n_blocks: int = 6, min_charging_
     for size1 in range(min_block_size, max_total_charging + 1):
         for start1 in range(0, 24 - size1 + 1):
             end1 = start1 + size1
-            avg1 = np.mean(prices[start1:end1])
+            cost1 = np.sum(np.array(prices[start1:end1]) * np.array(net_demand[start1:end1]))
 
             for size2 in range(min_block_size, max_total_charging + 1):
                 for start2 in range(0, 24 - size2 + 1):
@@ -93,7 +128,7 @@ def find_two_largest_cheap_blocks(prices: list, n_blocks: int = 6, min_charging_
                         if total_charging > max_total_charging:
                             continue
 
-                        avg2 = np.mean(prices[start2:end2])
+                        cost2 = np.sum(np.array(prices[start2:end2]) * np.array(net_demand[start2:end2]))
 
                         # Find gaps between charging blocks
                         gaps = []
@@ -123,15 +158,15 @@ def find_two_largest_cheap_blocks(prices: list, n_blocks: int = 6, min_charging_
                         if len(flat_hours) < (n_blocks - 2):
                             continue  # not enough hours
 
-                        # Score: prefer larger blocks and lower prices
-                        score = (total_charging, -(avg1 + avg2) / 2)
+                        # Score: prefer larger blocks and lower total cost
+                        score = (total_charging, -(cost1 + cost2))
                         block_candidates.append((score, (start1, end1), (start2, end2)))
 
     if not block_candidates:
         # fallback: just use two blocks respecting the minimum size
         return [(0, min(24, min_charging_block_hours)), (min(24, min_charging_block_hours), 24)]
 
-    # Sort by score: largest blocks, lowest average prices first
+    # Sort by score: largest blocks, lowest total cost first
     block_candidates.sort(reverse=True)
     best = block_candidates[0]
     return sorted([best[1], best[2]], key=lambda x: x[0])
@@ -228,10 +263,12 @@ def convert_intervals_to_times(intervals: list, times: list) -> list:
         result.append((start_time, end_time))
     return result
 
-def get_smart_intervals(prices, tomorrow, n_blocks=6, min_charging_block_hours=4):
+def get_smart_intervals(prices, tomorrow, consumption_forecast, solar_forecast, n_blocks=6, min_charging_block_hours=4):
     hourly_times = build_hourly_times(tomorrow)
     hourly_prices = get_prices_for_times(prices, hourly_times)
-    blocks = find_two_largest_cheap_blocks(hourly_prices, n_blocks=n_blocks, min_charging_block_hours=min_charging_block_hours)
+    # Calculate net demand for each hour (forecasted consumption - solar forecast)
+    net_demand = [max(0, consumption_forecast.get(t, 0) - solar_forecast.get(t, 0)) for t in hourly_times]
+    blocks = find_two_largest_cheap_blocks(hourly_prices, net_demand, n_blocks=n_blocks, min_charging_block_hours=min_charging_block_hours)
     intervals = build_intervals_with_min_charging_blocks(blocks, n_blocks=n_blocks)
     interval_times = convert_intervals_to_times(intervals, hourly_times)
     interval_starts = [tup[0] for tup in interval_times]
@@ -258,9 +295,9 @@ def forecast_next_day_consumption(consumption, forecast_date, N_days=14):
 
 def lookahead_schedule(
     prices, solar, consumption, interval_starts, interval_times,
-    initial_soc, margin_factor=1.10, diagnostics_enabled=True, price_percentile=75
+    initial_soc, margin_factor=1.10, diagnostics_enabled=True, price_percentile=75,
+    n_days=None, min_charging_block_hours=None
 ):
-    # ...[existing code above unchanged]...
     diagnostics = {}
     intervals = interval_times
     payload = {
@@ -289,7 +326,6 @@ def lookahead_schedule(
         interval_durations.append((dt_end - dt_start).total_seconds() / 3600)
         prices_in_interval.append({t: float(prices[t]) for t in interval_times_list})
 
-    # --- UPDATED LINE: use the parameter!
     price_threshold = np.percentile(price_per_interval, price_percentile) if price_per_interval else 0
     expensive_intervals = [
         i for i, p in enumerate(price_per_interval)
@@ -311,7 +347,7 @@ def lookahead_schedule(
         diagnostics["margin_factor"] = float(margin_factor)
         diagnostics["price_percentile"] = float(price_percentile)
 
-    soc = initial_soc
+    soc = initial_soc 
     battery_wh = BATTERY_CAPACITY * soc / 100
 
     for i in range(len(intervals)):
@@ -322,35 +358,73 @@ def lookahead_schedule(
 
         interval_hours = interval_durations[i]
         charge_wh_possible = CHARGE_POWER * interval_hours
+        discharge_wh_possible = POWER * interval_hours
 
-        if i not in expensive_intervals and soc < 100 and total_battery_wh_needed > 0:
-            charge_wh = min(charge_wh_possible, total_battery_wh_needed, BATTERY_CAPACITY * (100-soc)/100)
-            soc += charge_wh * 100 / BATTERY_CAPACITY
-            soc = min(soc, 100)
-            payload["enabled"][idx] = 1
-            payload["soc"][idx] = int(soc)
-            total_battery_wh_needed -= charge_wh
-            action = f"Charge {charge_wh:.2f} Wh"
-        elif i in expensive_intervals:
-            discharge_wh = min(net_demand_per_interval[i], BATTERY_CAPACITY * soc / 100)
-            soc -= discharge_wh * 100 / BATTERY_CAPACITY
-            soc = max(soc, BATTERY_MIN_SOC)
-            payload["enabled"][idx] = 0
-            payload["soc"][idx] = int(soc)
-            action = f"Discharge {discharge_wh:.2f} Wh"
+        action = "Idle"
+        # Charging logic
+        if i not in expensive_intervals and soc < BATTERY_MAX_SOC:
+            charge_wh = min(charge_wh_possible, BATTERY_CAPACITY * (BATTERY_MAX_SOC-soc)/100)
+            if charge_wh > 0:
+                battery_wh += charge_wh
+                calculated_soc = min(100, battery_wh * 100 / BATTERY_CAPACITY)
+                soc = calculated_soc  # Use calculated SOC for logic
+                payload["enabled"][idx] = 1
+                payload["soc"][idx] = 100  # Set SOC to 100% in payload only for this charging interval
+                action = f"Charge {charge_wh:.2f} Wh"
+            else:
+                calculated_soc = soc
+                payload["enabled"][idx] = 0
+                payload["soc"][idx] = int(soc)  # Use calculated SOC for non-charging intervals
+        # Discharging logic
+        elif i in expensive_intervals and soc > BATTERY_MIN_SOC:
+            available_discharge = battery_wh - BATTERY_CAPACITY * BATTERY_MIN_SOC / 100
+            discharge_wh = min(net_demand_per_interval[i], discharge_wh_possible, available_discharge)
+            if discharge_wh > 0:
+                battery_wh -= discharge_wh
+                calculated_soc = max(BATTERY_MIN_SOC, battery_wh * 100 / BATTERY_CAPACITY)
+                soc = calculated_soc  # Use calculated SOC for logic
+                payload["enabled"][idx] = 0
+                payload["soc"][idx] = BATTERY_MIN_SOC  # Set SOC to 10% in payload only for this discharge interval
+                action = f"Discharge {discharge_wh:.2f} Wh"
+            else:
+                calculated_soc = soc
+                payload["enabled"][idx] = 0
+                payload["soc"][idx] = int(soc)
         else:
+            calculated_soc = soc
             payload["enabled"][idx] = 0
             payload["soc"][idx] = int(soc)
-            action = "Idle"
 
         if diagnostics_enabled:
-            diagnostics[f"interval_{idx}"] = {
+            diag = {
                 "action": action,
-                "soc_after": soc
+                "soc_after": soc,
+                "calculated_soc": calculated_soc if 'calculated_soc' in locals() else soc,
+                "prices_in_interval": prices_in_interval[i]  # <-- add this line
             }
+            diagnostics[f"interval_{idx}"] = diag
 
     if diagnostics_enabled:
-        payload["diagnostics"] = diagnostics
+        # Reorder diagnostics for clarity
+        ordered_diag = {
+            "initial_soc": diagnostics.get("initial_soc"),
+            "margin_factor": diagnostics.get("margin_factor"),
+            "n_days": n_days if 'n_days' in locals() else None,
+            "min_charging_block_hours": min_charging_block_hours if 'min_charging_block_hours' in locals() else None,
+            "price_percentile": diagnostics.get("price_percentile"),
+            "total_battery_wh_needed": diagnostics.get("total_battery_wh_needed"),
+            "price_threshold": diagnostics.get("price_threshold"),
+            "net_demand_per_interval": diagnostics.get("net_demand_per_interval"),
+            "price_per_interval": diagnostics.get("price_per_interval"),
+            "expensive_intervals": diagnostics.get("expensive_intervals"),
+            "interval_durations": diagnostics.get("interval_durations"),
+            "interval_starts": diagnostics.get("interval_starts"),
+            "calculated_soc": [diagnostics[f"interval_{i+1}"]["calculated_soc"] for i in range(len(intervals))],
+        }
+        # Add per-interval details
+        for i in range(len(intervals)):
+            ordered_diag[f"interval_{i+1}"] = diagnostics.get(f"interval_{i+1}")
+        payload["diagnostics"] = ordered_diag
 
     return payload
 
@@ -371,10 +445,11 @@ def get_schedule():
         tomorrow = (datetime.now(ZoneInfo("Europe/Amsterdam")) + timedelta(days=1)).strftime("%Y-%m-%d")
         consumption_forecast = forecast_next_day_consumption(raw_consumption, tomorrow, N_days=n_days)
         interval_starts, interval_times = get_smart_intervals(
-            prices, tomorrow, n_blocks=INTERVALS, min_charging_block_hours=min_charging_block_hours)
+            prices, tomorrow, consumption_forecast, solar, n_blocks=INTERVALS, min_charging_block_hours=min_charging_block_hours)
         schedule = lookahead_schedule(
             prices, solar, consumption_forecast, interval_starts, interval_times,
-            current_soc, margin_factor, diagnostics_enabled=True, price_percentile=price_percentile
+            current_soc, margin_factor, diagnostics_enabled=True, price_percentile=price_percentile,
+            n_days=n_days, min_charging_block_hours=min_charging_block_hours
         )
         return jsonify(schedule)
     except Exception as e:
@@ -412,5 +487,26 @@ def get_consumption_forecast():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/recent_prices', methods=['GET'])
+def get_recent_prices():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        prices = load_prices(conn)
+        conn.close()
+        # Get last 5 days
+        sorted_times = sorted(prices.keys(), reverse=True)
+        last_5_days = set()
+        recent_prices = {}
+        for t in sorted_times:
+            day = t[:10]
+            if day not in last_5_days:
+                if len(last_5_days) >= 5:
+                    break
+                last_5_days.add(day)
+            recent_prices[t] = prices[t]
+        return jsonify(recent_prices)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5005)
+    app.run(host="0.0.0.0", port=5555)
