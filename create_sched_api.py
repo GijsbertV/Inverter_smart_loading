@@ -463,6 +463,7 @@ def get_consumption_forecast():
         conn = sqlite3.connect(DB_PATH)
         raw_consumption = load_consumption(conn)
         solar_forecast = load_solar_forecast(conn)
+        prices = load_prices(conn)
         conn.close()
         tomorrow = (datetime.now(ZoneInfo("Europe/Amsterdam")) + timedelta(days=1)).strftime("%Y-%m-%d")
         consumption_forecast = forecast_next_day_consumption(raw_consumption, tomorrow, N_days=n_days)
@@ -472,11 +473,17 @@ def get_consumption_forecast():
             t_next = "%s %02d:00:00" % (tomorrow, hour)
             consumption = consumption_forecast.get(t_next, 0)
             solar = solar_forecast.get(t_next, 0)
-            net_need = max(0, consumption - solar)
+            net_need = consumption - solar
+            price = prices.get(t_next, 0)
+            cost = (net_need / 1000) * price
+            hour_short = t_next[11:16]  # Extract HH:MI
             forecast_output[t_next] = {
+                "Hour_short": hour_short,  # <-- New column
                 "forecasted_consumption": consumption,
                 "solar_forecast": solar,
-                "net_need": net_need
+                "net_need": net_need,
+                "price": price,
+                "cost": cost
             }
         return jsonify({
             "forecast_date": tomorrow,
